@@ -1,4 +1,5 @@
 """把一屏截图的识别结果还原成结构化消息（针对 PC 微信 4.x 的默认浅色界面）。"""
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -40,17 +41,24 @@ def _lum(px):
 
 def detect_layout(img: Image.Image) -> Layout:
     """根据颜色找出右侧聊天区：左边界 = 会话列表变成浅色背景处；上下边界 = 横跨整个聊天区的分隔线。"""
+    from collections import Counter
     W, H = img.size
     px = img.load()
-    probe_y = 40
-    bg = px[W - 40, probe_y]
-    x0 = next((x for x in range(W // 5, W // 2) if px[x, probe_y] == bg and px[x - 1, probe_y] != bg), W // 3)
+    # 聊天区背景色：窗口右半部分中间最常见的颜色（最大化时顶部是标题栏，不能用顶部取色）
+    bg = Counter(px[x, y] for x in range(W * 6 // 10, W - 20, 7)
+                 for y in range(H // 5, H * 4 // 5, 11)).most_common(1)[0][0]
+    # 左边界：会话列表结束、背景色开始的位置；取多行的众数，避开头像/选中项的干扰
+    cands = []
+    for y in range(H // 5, H * 3 // 5, max(1, H // 25)):
+        x = next((x for x in range(W // 8, W // 2) if px[x, y] == bg and px[x - 1, y] != bg), None)
+        if x is not None:
+            cands.append(x)
+    x0 = Counter(cands).most_common(1)[0][0] if cands else W // 3
     x1 = W - 1
     for x in range(W - 2, x0, -1):
         if px[x, H // 2] == bg:
             x1 = x
             break
-    bg = px[(x0 + x1) // 2, probe_y]
 
     def sep_row(y):
         c = px[(x0 + x1) // 2, y]
@@ -59,8 +67,9 @@ def detect_layout(img: Image.Image) -> Layout:
         xs = range(x0 + 30, x1 - 30, 4)
         return sum(abs(_lum(px[x, y]) - _lum(c)) <= 3 for x in xs) >= 0.9 * len(xs)
 
-    seps = [y for y in range(35, H - 20) if sep_row(y)]
-    y0 = next((y for y in seps if y < H // 4), 80) + 1
+    seps = [y for y in range(5, H - 20) if sep_row(y)]
+    # 标题栏下沿和聊天标题下的分隔线都在顶部，消息区从最靠下的那条开始
+    y0 = max((y for y in seps if y < 160), default=80) + 1
     # 输入框上沿：中下部第一条分隔线
     y1 = next((y for y in seps if y > H // 3), H - 300) - 1
     return Layout(x0, x1, y0, y1)
@@ -71,7 +80,7 @@ def chat_title(lines: list[Line], lay: Layout) -> str:
     if not head:
         return ""
     t = min(head, key=lambda l: l.x).text
-    return re.sub(r"\s*\(\d+\)\s*$", "", t).strip()
+    return re.sub(r"\s*[(（]\d+[)）]\s*$", "", t).strip()
 
 
 def _bubble_masks(img: Image.Image):
@@ -219,9 +228,17 @@ def parse_screen(img: Image.Image, lines: list[Line], lay: Layout) -> list[Msg]:
 
 def screen_lines(img: Image.Image, lay: Layout) -> list[Line]:
     """只识别聊天区（含标题栏），比整窗识别快，坐标换算回整窗。"""
-    lines = ocr(img.crop((lay.x0, 0, lay.x1, lay.y1)))
+    hires, s = img.info.get("hires"), img.info.get("scale", 1.0)
+    if hires is None or os.environ.get("WX_LOWRES"):
+        lines = ocr(img.crop((lay.x0, 0, lay.x1, lay.y1)))
+        for l in lines:
+            l.x += lay.x0
+        return lines
+    # 高缩放显示器：在原始高清图上识别，再把坐标换算回 100% 缩放
+    lines = ocr(hires.crop((round(lay.x0 * s), 0, round(lay.x1 * s), round(lay.y1 * s))))
     for l in lines:
-        l.x += lay.x0
+        l.x, l.y = round(l.x / s) + lay.x0, round(l.y / s)
+        l.w, l.h = round(l.w / s), round(l.h / s)
     return lines
 
 

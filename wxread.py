@@ -19,13 +19,20 @@ from datetime import datetime, timedelta
 import wxcore
 import wxparse
 
-PX_PER_NOTCH = 70  # 实测微信每格滚轮约滚 70 像素
-PAGE_RATIO = 0.55  # 每次翻过消息区高度的 55%，相邻两屏保留近一半重叠用于拼接
+PX_PER_NOTCH = 75  # 每格滚轮滚多少像素的初始估计；实际值在 55~80 之间浮动，抓取中会按实测更新
+PAGE_RATIO = 0.6  # 每次翻过消息区高度的 60%，保留约 40% 重叠；实测 78% 时重叠太少会漏拼
 
 
-def notches_for(lay) -> int:
-    """窗口越高，每次翻得越多：消息区高度决定翻页格数。"""
-    return max(2, int((lay.y1 - lay.y0) * PAGE_RATIO / PX_PER_NOTCH))
+def notches_for(lay, px_per_notch: float) -> int:
+    """窗口越高，每次翻得越多：按消息区高度和实测的每格距离算出翻页格数。"""
+    return max(2, min(20, int((lay.y1 - lay.y0) * PAGE_RATIO / px_per_notch)))
+
+
+def _measure_shift(prev: list, cur: list) -> int | None:
+    """同一条消息在前后两屏里的纵向位移 = 实际滚动的像素。"""
+    shifts = sorted(b.top - a.top for a in prev for b in cur
+                    if _same(a, b) and a.sender == b.sender and b.top > a.top)
+    return shifts[len(shifts) // 2] if shifts else None
 
 
 def _norm(s: str) -> str:
@@ -56,6 +63,23 @@ def snapshot(hwnd):
     return img, lines, lay, wxparse.parse_screen(img, lines, lay)
 
 
+def _unify_senders(msgs):
+    """同一个昵称被识别成几种写法（如只差一个字）时，统一成出现次数最多的那种。"""
+    from collections import Counter
+    counts = Counter(m.sender for m in msgs if m.sender and m.sender != "我")
+    canon = {}
+    for name, _ in counts.most_common():
+        for c in set(canon.values()):
+            if len(name) == len(c) and len(name) >= 3 and sum(a != b for a, b in zip(name, c)) == 1:
+                canon[name] = c
+                break
+        else:
+            canon[name] = name
+    for m in msgs:
+        if m.sender in canon:
+            m.sender = canon[m.sender]
+
+
 def _merge_into(dst: wxparse.Msg, src: wxparse.Msg):
     """同一条消息在另一屏里看到了更多信息（昵称、前面的时间分隔、引用），补到已有记录上。"""
     dst.sender = dst.sender or src.sender
@@ -73,18 +97,24 @@ def read_chat(days: float = 1, max_screens: int = 30, log=print):
     # 只拼接消息本身；时间分隔记在它后面那条消息的 time_before 上，避免分隔线错位
     acc = [m for m in items if m.kind == "msg" and not (m.partial and m.top - lay.y0 < 30)]
     scrolled = stuck = gaps = 0
+    ppn = PX_PER_NOTCH
+    prev = [m for m in items if m.kind == "msg" and not m.partial]
     try:
         for n in range(1, max_screens):
             oldest = next((t for t in (wxparse.parse_time(m.time_before) for m in acc if m.time_before) if t), None)
             if oldest and oldest < cutoff:
                 log(f"已翻到 {oldest:%m-%d %H:%M}，早于要求的时间范围，停止")
                 break
-            step = notches_for(lay)
+            step = notches_for(lay, ppn)
             wxcore.scroll(hwnd, cx, cy, step)
             scrolled += step
-            time.sleep(0.6)  # 等待界面渲染/加载更早的消息
+            time.sleep(0.4)  # 等待界面渲染/加载更早的消息
             img, lines, lay, items = snapshot(hwnd)
             screen = [m for m in items if m.kind == "msg" and not m.partial]
+            shift = _measure_shift(prev, screen)
+            if shift:
+                ppn = (ppn + shift / step) / 2  # 平滑更新每格距离
+            prev = screen
             k = _overlap(screen, acc)
             for i in range(k):
                 _merge_into(acc[i], screen[len(screen) - k + i])
@@ -97,13 +127,15 @@ def read_chat(days: float = 1, max_screens: int = 30, log=print):
                 continue
             stuck = 0
             if k == 0 and acc:
+                ppn *= 1.4  # 翻过头了，下次少翻一点
                 gaps += 1
                 acc[0].gap_before = True
             acc = new + acc
-            log(f"第 {n + 1} 屏：新增 {len(new)} 条，累计 {len(acc)} 条")
+            log(f"第 {n + 1} 屏：翻 {step} 格，新增 {len(new)} 条，累计 {len(acc)} 条")
     finally:
-        wxcore.scroll(hwnd, cx, cy, -(scrolled + 20))  # 滚回最底部，恢复原来的视图
+        wxcore.scroll(hwnd, cx, cy, -(scrolled * 2 + 20))  # 滚回最底部，恢复原来的视图
 
+    _unify_senders(acc)
     is_group = any(m.side == "other" and m.sender for m in acc)
     out, cur_time = [], None
     for m in acc:

@@ -84,8 +84,27 @@ def window_rect(hwnd: int):
     return r.left, r.top, r.right, r.bottom
 
 
+def dpi_scale(hwnd: int) -> float:
+    """窗口所在显示器的缩放比例（100% → 1.0，200% → 2.0）。"""
+    try:
+        return user32.GetDpiForWindow(hwnd) / 96 or 1.0
+    except Exception:
+        return 1.0
+
+
 def capture(hwnd: int) -> Image.Image:
-    """截取窗口自身的画面（被其它窗口遮住也能截到）。"""
+    """截取窗口画面（被其它窗口遮住也能截到），并统一缩放到 100% 缩放下的尺寸，
+    这样后续按像素写的规则在任何缩放比例的显示器上都适用。"""
+    raw = _capture_raw(hwnd)
+    s = dpi_scale(hwnd)
+    if abs(s - 1.0) <= 0.01:
+        return raw
+    img = raw.resize((round(raw.width / s), round(raw.height / s)), Image.LANCZOS)
+    img.info["hires"], img.info["scale"] = raw, s  # 文字识别用原始高清图，更准
+    return img
+
+
+def _capture_raw(hwnd: int) -> Image.Image:
     left, top, right, bottom = window_rect(hwnd)
     w, h = right - left, bottom - top
     wdc = user32.GetWindowDC(hwnd)
@@ -111,10 +130,12 @@ def capture(hwnd: int) -> Image.Image:
 
 
 def scroll(hwnd: int, x: int, y: int, notches: int):
-    """向窗口内 (x, y) 处发送滚轮消息；notches 为正表示向上翻。不移动真实鼠标。"""
+    """向窗口内 (x, y) 处发送滚轮消息；notches 为正表示向上翻。不移动真实鼠标。
+    x、y 是 capture() 返回图里的坐标（100% 缩放），这里换算回屏幕真实像素。"""
     import time
     left, top, _, _ = window_rect(hwnd)
-    sx, sy = left + x, top + y
+    s = dpi_scale(hwnd)
+    sx, sy = left + round(x * s), top + round(y * s)
     step = 120 if notches > 0 else -120
     wparam = (step << 16) & 0xFFFFFFFF
     lparam = (sy & 0xFFFF) << 16 | (sx & 0xFFFF)
